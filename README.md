@@ -211,3 +211,4 @@ Defined at the top of [`engine.py`](engine.py):
   categories.
 - `add_few_shot_example(category, fingerprint)` lets you reinforce a category
   with new examples at runtime (rejects unknown category names).
+# xml_categorization_fingerprint
