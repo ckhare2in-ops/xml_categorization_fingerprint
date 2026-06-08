@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Generated runtime data
+errors.jsonl
+embeddings.npy
+embeddings_meta.jsonl
+review_queue.jsonl
