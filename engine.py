@@ -1,26 +1,31 @@
-"""3-Stage XML Error Classification Engine.
+"""3-Stage XML Error Classification Engine (LangChain implementation).
 
 Pipeline:
-    Stage 1  normalize_error()    raw error -> intent fingerprint (Groq LLM)
-    Stage 2  embed_fingerprint()  fingerprint -> embedding vector (MiniLM)
-    Stage 3  classify_error()     fingerprint -> one canonical category (Groq LLM)
+    Stage 1  normalize_error()    raw error -> intent fingerprint
+             (ChatGroq + ChatPromptTemplate + JsonOutputParser, via LCEL)
+    Stage 2  embed_fingerprint()  fingerprint -> embedding vector
+             (langchain-huggingface HuggingFaceEmbeddings, all-MiniLM-L6-v2)
+    Stage 3  classify_error()     fingerprint -> one canonical category
+             (ChatGroq + ChatPromptTemplate + StrOutputParser, via LCEL)
 
-The orchestrator ``classify_pipeline()`` runs all three stages, persists the
-result, and stores the embedding for later similarity search.
+Every classified error is stored in a LangChain FAISS vector store, which backs
+``find_similar_errors()``. The orchestrator ``classify_pipeline()`` runs all
+three stages, persists the result, and returns the record.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
 
-import numpy as np
 from dotenv import load_dotenv
-from groq import Groq
+from langchain_core.messages import SystemMessage
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 
 from taxonomy import CATEGORY_NAMES, TAXONOMY, UNKNOWN_CATEGORY, get_category
 
@@ -38,9 +43,8 @@ MAX_RETRIES = 3
 
 BASE_DIR = Path(__file__).resolve().parent
 ERRORS_FILE = BASE_DIR / "errors.jsonl"
-EMBEDDINGS_FILE = BASE_DIR / "embeddings.npy"
-EMBEDDINGS_META_FILE = BASE_DIR / "embeddings_meta.jsonl"
 REVIEW_QUEUE_FILE = BASE_DIR / "review_queue.jsonl"
+FAISS_DIR = BASE_DIR / "faiss_index"
 
 FINGERPRINT_KEYS = ("violation_type", "constraint_kind", "scope", "actor")
 
@@ -64,72 +68,89 @@ You will receive a structured error fingerprint and must assign it to EXACTLY ON
 Return ONLY the exact category name — no explanation, no punctuation, nothing else.
 Only return "Unknown / Unclassified" if the fingerprint genuinely does not fit any category."""
 
+# SystemMessage (not a template tuple) so the literal JSON braces in the
+# normalize prompt are not parsed as template variables. The human turn carries
+# the only variable; substituted values are inserted literally, never re-parsed.
+NORMALIZE_PROMPT = ChatPromptTemplate.from_messages(
+    [SystemMessage(content=NORMALIZE_SYSTEM_PROMPT), ("human", "{raw_error}")]
+)
+CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
+    [SystemMessage(content=CLASSIFY_SYSTEM_PROMPT), ("human", "{user_message}")]
+)
+
 
 # --------------------------------------------------------------------------- #
-# Lazily-initialised clients (so importing the module is cheap / test-friendly)
+# Lazily-initialised LangChain components
 # --------------------------------------------------------------------------- #
 
 @lru_cache(maxsize=1)
-def _groq_client() -> Groq:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
+def _llm():
+    from langchain_groq import ChatGroq
+
+    if not os.getenv("GROQ_API_KEY"):
         raise RuntimeError(
             "GROQ_API_KEY is not set. Copy .env.example to .env and add your key."
         )
-    return Groq(api_key=api_key)
+    return ChatGroq(model=MODEL, temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
 
 
 @lru_cache(maxsize=1)
 def _embedder():
-    # Imported here so the (heavy) torch/sentence-transformers import only
+    # Imported here so the heavy torch / sentence-transformers import only
     # happens when embeddings are actually needed.
-    from sentence_transformers import SentenceTransformer
+    from langchain_huggingface import HuggingFaceEmbeddings
 
-    return SentenceTransformer(EMBED_MODEL)
+    return HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Retry helper
-# --------------------------------------------------------------------------- #
+def _retry(runnable):
+    """Wrap a runnable with 3 attempts and exponential backoff (LangChain)."""
+    return runnable.with_retry(
+        stop_after_attempt=MAX_RETRIES,
+        wait_exponential_jitter=True,
+    )
 
-def _with_retries(fn, *, what: str):
-    """Call ``fn`` with up to MAX_RETRIES attempts and exponential backoff."""
-    last_exc = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001 - we re-raise after retries
-            last_exc = exc
-            if attempt < MAX_RETRIES - 1:
-                wait = 2 ** attempt  # 1s, 2s, 4s
-                time.sleep(wait)
-    raise RuntimeError(f"{what} failed after {MAX_RETRIES} attempts") from last_exc
+
+@lru_cache(maxsize=1)
+def _normalize_chain():
+    # raw_error -> JSON -> fingerprint with exactly FINGERPRINT_KEYS.
+    chain = (
+        NORMALIZE_PROMPT
+        | _llm()
+        | JsonOutputParser()
+        | RunnableLambda(_coerce_fingerprint)
+    )
+    return _retry(chain)
+
+
+@lru_cache(maxsize=1)
+def _classify_chain():
+    # user_message -> raw category string -> validated taxonomy name.
+    chain = (
+        CLASSIFY_PROMPT
+        | _llm()
+        | StrOutputParser()
+        | RunnableLambda(_coerce_category)
+    )
+    return _retry(chain)
 
 
 # --------------------------------------------------------------------------- #
 # Stage 1 — Normalize
 # --------------------------------------------------------------------------- #
 
+def _coerce_fingerprint(parsed: dict) -> dict:
+    """Guarantee all expected keys exist (empty string if the LLM omitted one)."""
+    parsed = parsed or {}
+    return {key: parsed.get(key, "") for key in FINGERPRINT_KEYS}
+
+
 def normalize_error(raw_error: str) -> dict:
     """Extract a structured intent fingerprint from a raw error message."""
-
-    def _call():
-        resp = _groq_client().chat.completions.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            messages=[
-                {"role": "system", "content": NORMALIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": raw_error},
-            ],
-        )
-        return resp.choices[0].message.content
-
-    content = _with_retries(_call, what="normalize_error")
-    fingerprint = _parse_json(content)
-
-    # Guarantee all expected keys exist (empty string if the LLM omitted one).
-    return {key: fingerprint.get(key, "") for key in FINGERPRINT_KEYS}
+    return _normalize_chain().invoke({"raw_error": raw_error})
 
 
 # --------------------------------------------------------------------------- #
@@ -144,8 +165,7 @@ def _stable_fingerprint_string(fingerprint: dict) -> str:
 def embed_fingerprint(fingerprint: dict) -> list[float]:
     """Generate an embedding vector for a fingerprint dict."""
     text = _stable_fingerprint_string(fingerprint)
-    vector = _embedder().encode(text, normalize_embeddings=True)
-    return np.asarray(vector, dtype=np.float32).tolist()
+    return _embedder().embed_query(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +193,6 @@ def _build_taxonomy_block() -> str:
 def classify_error(fingerprint: dict) -> str:
     """Assign the fingerprint to exactly one canonical taxonomy category."""
     fingerprint_json = _stable_fingerprint_string(fingerprint)
-
     user_message = (
         "Taxonomy categories and definitions:\n"
         f"{_build_taxonomy_block()}\n\n"
@@ -181,21 +200,7 @@ def classify_error(fingerprint: dict) -> str:
         f"{_build_few_shot_block()}\n\n"
         f"fingerprint: {fingerprint_json}"
     )
-
-    def _call():
-        resp = _groq_client().chat.completions.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            messages=[
-                {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-        )
-        return resp.choices[0].message.content
-
-    raw = _with_retries(_call, what="classify_error")
-    return _coerce_category(raw)
+    return _classify_chain().invoke({"user_message": user_message})
 
 
 def _coerce_category(raw: str) -> str:
@@ -209,7 +214,6 @@ def _coerce_category(raw: str) -> str:
     if candidate in CATEGORY_NAMES:
         return candidate
 
-    # Case-insensitive fallback match.
     lowered = candidate.lower()
     for name in CATEGORY_NAMES:
         if name.lower() == lowered:
@@ -223,7 +227,12 @@ def _coerce_category(raw: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def add_few_shot_example(category: str, fingerprint: dict) -> None:
-    """Append a few-shot example to an existing taxonomy category at runtime."""
+    """Append a few-shot example to an existing taxonomy category at runtime.
+
+    The example is read fresh into the prompt on each ``classify_error`` call,
+    so additions take effect immediately (the chain is cached, the prompt body
+    is rebuilt per call).
+    """
     entry = get_category(category)
     if entry is None:
         raise ValueError(
@@ -236,48 +245,56 @@ def add_few_shot_example(category: str, fingerprint: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Storage
+# Vector store (FAISS) + storage
 # --------------------------------------------------------------------------- #
+
+def _load_vectorstore():
+    """Load the persisted FAISS store, or return None if none exists yet."""
+    from langchain_community.vectorstores import FAISS
+
+    if not FAISS_DIR.exists():
+        return None
+    # Local, self-produced index -> safe to deserialize.
+    return FAISS.load_local(
+        str(FAISS_DIR), _embedder(), allow_dangerous_deserialization=True
+    )
+
+
+def _add_to_vectorstore(text: str, embedding: list[float], metadata: dict) -> None:
+    """Add one pre-embedded record to the FAISS store and persist it."""
+    from langchain_community.vectorstores import FAISS
+
+    vs = _load_vectorstore()
+    if vs is None:
+        vs = FAISS.from_embeddings(
+            [(text, embedding)], _embedder(), metadatas=[metadata]
+        )
+    else:
+        vs.add_embeddings([(text, embedding)], metadatas=[metadata])
+    vs.save_local(str(FAISS_DIR))
+
 
 def _append_jsonl(path: Path, obj: dict) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def _store_embedding(vector: list[float]) -> None:
-    """Append a vector as a new row in the embeddings.npy matrix."""
-    arr = np.asarray(vector, dtype=np.float32).reshape(1, -1)
-    if EMBEDDINGS_FILE.exists():
-        existing = np.load(EMBEDDINGS_FILE)
-        if existing.size == 0:
-            stacked = arr
-        else:
-            stacked = np.vstack([existing, arr])
-    else:
-        stacked = arr
-    np.save(EMBEDDINGS_FILE, stacked)
-
-
 def _persist_result(result: dict) -> None:
-    """Write a classified error to all output files."""
-    # 1. Full record -> errors.jsonl (without the bulky embedding inline).
+    """Write a classified error to the log files and the FAISS store."""
     record = {k: v for k, v in result.items() if k != "embedding"}
+
+    # Human-readable append-only log of every classification.
     _append_jsonl(ERRORS_FILE, record)
 
-    # 2. Embedding vector -> embeddings.npy (row order matches meta file).
-    _store_embedding(result["embedding"])
-
-    # 3. Embedding metadata index -> embeddings_meta.jsonl.
-    _append_jsonl(
-        EMBEDDINGS_META_FILE,
-        {
-            "id": result["id"],
-            "customer_id": result["customer_id"],
-            "category": result["category"],
-        },
+    # Searchable store: the fingerprint text + its precomputed embedding, with
+    # the full record carried as metadata (used by find_similar_errors).
+    _add_to_vectorstore(
+        _stable_fingerprint_string(result["fingerprint"]),
+        result["embedding"],
+        record,
     )
 
-    # 4. Unknown classifications -> review_queue.jsonl.
+    # Unknown classifications are queued for human review.
     if result["category"] == UNKNOWN_CATEGORY:
         _append_jsonl(REVIEW_QUEUE_FILE, record)
 
@@ -309,79 +326,39 @@ def classify_pipeline(raw_error: str, customer_id: str) -> dict:
 # Similarity search (feedback loop)
 # --------------------------------------------------------------------------- #
 
-def _cosine_similarity(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Cosine similarity between a query vector and each row of a matrix."""
-    q_norm = query / (np.linalg.norm(query) + 1e-12)
-    m_norms = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
-    return m_norms @ q_norm
+def _l2_to_cosine(squared_l2: float) -> float:
+    """Convert FAISS squared-L2 distance to cosine similarity.
 
-
-def _load_errors() -> list[dict]:
-    if not ERRORS_FILE.exists():
-        return []
-    with ERRORS_FILE.open(encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh if line.strip()]
+    Embeddings are L2-normalized, so ||a - b||^2 = 2 - 2*cos, giving
+    cos = 1 - dist/2 (higher = more similar).
+    """
+    return float(1.0 - squared_l2 / 2.0)
 
 
 def find_similar_errors(raw_error: str, top_k: int = 5) -> list[dict]:
     """Return the top-k most similar previously-classified errors.
 
-    Normalizes and embeds the input, then ranks stored embeddings by cosine
-    similarity. Row order in ``embeddings.npy`` matches line order in
-    ``errors.jsonl`` / ``embeddings_meta.jsonl``.
+    Normalizes and embeds the input, then queries the FAISS vector store.
     """
-    if not EMBEDDINGS_FILE.exists():
+    vs = _load_vectorstore()
+    if vs is None:
         return []
 
-    matrix = np.load(EMBEDDINGS_FILE)
-    if matrix.size == 0:
-        return []
-
-    errors = _load_errors()
     fingerprint = normalize_error(raw_error)
-    query = np.asarray(embed_fingerprint(fingerprint), dtype=np.float32)
-
-    scores = _cosine_similarity(query, matrix)
-    n = min(top_k, len(scores), len(errors))
-    top_idx = np.argsort(scores)[::-1][:n]
+    vector = embed_fingerprint(fingerprint)
+    hits = vs.similarity_search_with_score_by_vector(vector, k=top_k)
 
     results = []
-    for idx in top_idx:
-        record = errors[idx]
+    for doc, score in hits:
+        md = doc.metadata
         results.append(
             {
-                "id": record.get("id"),
-                "customer_id": record.get("customer_id"),
-                "raw_error": record.get("raw_error"),
-                "fingerprint": record.get("fingerprint"),
-                "category": record.get("category"),
-                "similarity": float(scores[idx]),
+                "id": md.get("id"),
+                "customer_id": md.get("customer_id"),
+                "raw_error": md.get("raw_error"),
+                "fingerprint": md.get("fingerprint"),
+                "category": md.get("category"),
+                "similarity": _l2_to_cosine(score),
             }
         )
     return results
-
-
-# --------------------------------------------------------------------------- #
-# Internal helpers
-# --------------------------------------------------------------------------- #
-
-def _parse_json(content: str) -> dict:
-    """Parse JSON from an LLM response, tolerating markdown code fences."""
-    text = (content or "").strip()
-
-    # Strip ```json ... ``` or ``` ... ``` fences if present.
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().startswith("json"):
-            text = text.lstrip()[4:]
-        text = text.strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Last resort: extract the first {...} block.
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
-        raise

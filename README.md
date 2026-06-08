@@ -4,34 +4,45 @@ Normalizes raw error messages from multiple customers into a single, consistent
 taxonomy of 16 canonical categories — so that two customers reporting the "same"
 problem in completely different wording land on the **same** category.
 
+Built on **LangChain**: the two LLM stages are LCEL chains over `ChatGroq`, the
+embedding stage uses `HuggingFaceEmbeddings`, and similarity search is backed by
+a LangChain **FAISS** vector store.
+
 ## How it works
 
 ```
 Customer Raw Error
        │
        ▼
-Stage 1 — Normalize (LLM, Groq)
+Stage 1 — Normalize (LangChain LCEL: ChatGroq + JsonOutputParser)
    Strip customer-specific values → extract a structural "intent fingerprint"
        │
        ▼
-Stage 2 — Embed (sentence-transformers, all-MiniLM-L6-v2)
-   Fingerprint → embedding vector (for similarity search)
+Stage 2 — Embed (LangChain HuggingFaceEmbeddings, all-MiniLM-L6-v2)
+   Fingerprint → embedding vector → FAISS vector store (for similarity search)
        │
        ▼
-Stage 3 — Classify (LLM + fixed 16-category taxonomy)
+Stage 3 — Classify (LangChain LCEL: ChatGroq + fixed 16-category taxonomy)
    Pick EXACTLY one canonical category
        │
        ▼
 Canonical Category (consistent across all customers)
 ```
 
-- **Stage 1** ([`normalize_error`](engine.py)) calls the Groq LLM to extract a
-  fingerprint with keys `violation_type`, `constraint_kind`, `scope`, `actor`.
+- **Stage 1** ([`normalize_error`](engine.py)) is an LCEL chain
+  `ChatPromptTemplate | ChatGroq | JsonOutputParser | RunnableLambda` that
+  extracts a fingerprint with keys `violation_type`, `constraint_kind`, `scope`,
+  `actor`.
 - **Stage 2** ([`embed_fingerprint`](engine.py)) serializes the fingerprint with
-  sorted keys and embeds it with `all-MiniLM-L6-v2`.
-- **Stage 3** ([`classify_error`](engine.py)) maps the fingerprint to one of the
-  16 fixed categories in [`taxonomy.py`](taxonomy.py). New categories are
-  **never** invented — anything that doesn't fit becomes `Unknown / Unclassified`.
+  sorted keys and embeds it with `HuggingFaceEmbeddings` (`all-MiniLM-L6-v2`,
+  L2-normalized).
+- **Stage 3** ([`classify_error`](engine.py)) is an LCEL chain
+  `ChatPromptTemplate | ChatGroq | StrOutputParser | RunnableLambda` that maps
+  the fingerprint to one of the 16 fixed categories in
+  [`taxonomy.py`](taxonomy.py). New categories are **never** invented — anything
+  that doesn't fit becomes `Unknown / Unclassified`.
+- Each LLM chain is wrapped with LangChain's native `.with_retry(...)` (3
+  attempts, exponential backoff with jitter).
 
 ## Setup
 
@@ -182,11 +193,10 @@ python classify.py \
 
 ## Output files
 
-| File | Purpose |
-|------|---------|
-| `errors.jsonl` | Every classified error, one JSON object per line. |
-| `embeddings.npy` | Numpy matrix of all embedding vectors (row order matches the lines in `errors.jsonl` / `embeddings_meta.jsonl`). |
-| `embeddings_meta.jsonl` | Per-embedding metadata index: `id`, `customer_id`, `category`. |
+| Store | Purpose |
+|-------|---------|
+| `errors.jsonl` | Human-readable append-only log of every classified error, one JSON object per line. |
+| `faiss_index/` | LangChain FAISS vector store (`index.faiss` + `index.pkl`). The searchable record of every error, with the full record in each document's metadata; backs `find_similar_errors`. |
 | `review_queue.jsonl` | Errors that returned `Unknown / Unclassified`, queued for human review. |
 
 These are created automatically on first run and are git-ignored.
@@ -197,11 +207,12 @@ Defined at the top of [`engine.py`](engine.py):
 
 | Setting | Value |
 |---------|-------|
-| LLM model | `llama-3.3-70b-versatile` |
-| Embedding model | `all-MiniLM-L6-v2` |
+| LLM | `ChatGroq`, model `llama-3.3-70b-versatile` |
+| Embeddings | `HuggingFaceEmbeddings`, `all-MiniLM-L6-v2` (L2-normalized) |
+| Vector store | LangChain `FAISS` (cosine via squared-L2 conversion) |
 | `max_tokens` | `200` |
 | `temperature` | `0` |
-| Retry policy | up to 3 attempts per LLM call, exponential backoff (1s, 2s, 4s) |
+| Retry policy | `.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)` per chain |
 
 ## Taxonomy governance
 

@@ -7,6 +7,5 @@ venv/
 
 # Generated runtime data
 errors.jsonl
-embeddings.npy
-embeddings_meta.jsonl
 review_queue.jsonl
+faiss_index/
