@@ -4,9 +4,10 @@ Normalizes raw error messages from multiple customers into a single, consistent
 taxonomy of 16 canonical categories — so that two customers reporting the "same"
 problem in completely different wording land on the **same** category.
 
-Built on **LangChain**: the two LLM stages are LCEL chains over `ChatGroq`, the
-embedding stage uses `HuggingFaceEmbeddings`, and similarity search is backed by
-a LangChain **FAISS** vector store.
+Built on **LangChain**: the two LLM stages are LCEL chains over `ChatOpenAI`
+(`gpt-4o-mini`), the embedding stage uses `OpenAIEmbeddings`
+(`text-embedding-3-small`), and similarity search is backed by a LangChain
+**FAISS** vector store. LLM calls are traced with **Langfuse**.
 
 ## How it works
 
@@ -14,15 +15,15 @@ a LangChain **FAISS** vector store.
 Customer Raw Error
        │
        ▼
-Stage 1 — Normalize (LangChain LCEL: ChatGroq + JsonOutputParser)
+Stage 1 — Normalize (LangChain LCEL: ChatOpenAI gpt-4o-mini + JsonOutputParser)
    Strip customer-specific values → extract a structural "intent fingerprint"
        │
        ▼
-Stage 2 — Embed (LangChain HuggingFaceEmbeddings, all-MiniLM-L6-v2)
+Stage 2 — Embed (LangChain OpenAIEmbeddings, text-embedding-3-small)
    Fingerprint → embedding vector → FAISS vector store (for similarity search)
        │
        ▼
-Stage 3 — Classify (LangChain LCEL: ChatGroq + fixed 16-category taxonomy)
+Stage 3 — Classify (LangChain LCEL: ChatOpenAI gpt-4o-mini + fixed taxonomy)
    Pick EXACTLY one canonical category
        │
        ▼
@@ -30,19 +31,20 @@ Canonical Category (consistent across all customers)
 ```
 
 - **Stage 1** ([`normalize_error`](engine.py)) is an LCEL chain
-  `ChatPromptTemplate | ChatGroq | JsonOutputParser | RunnableLambda` that
+  `ChatPromptTemplate | ChatOpenAI | JsonOutputParser | RunnableLambda` that
   extracts a fingerprint with keys `violation_type`, `constraint_kind`, `scope`,
   `actor`.
 - **Stage 2** ([`embed_fingerprint`](engine.py)) serializes the fingerprint with
-  sorted keys and embeds it with `HuggingFaceEmbeddings` (`all-MiniLM-L6-v2`,
-  L2-normalized).
+  sorted keys and embeds it with `OpenAIEmbeddings` (`text-embedding-3-small`,
+  1536-dim, unit-normalized).
 - **Stage 3** ([`classify_error`](engine.py)) is an LCEL chain
-  `ChatPromptTemplate | ChatGroq | StrOutputParser | RunnableLambda` that maps
+  `ChatPromptTemplate | ChatOpenAI | StrOutputParser | RunnableLambda` that maps
   the fingerprint to one of the 16 fixed categories in
   [`taxonomy.py`](taxonomy.py). New categories are **never** invented — anything
   that doesn't fit becomes `Unknown / Unclassified`.
 - Each LLM chain is wrapped with LangChain's native `.with_retry(...)` (3
-  attempts, exponential backoff with jitter).
+  attempts, exponential backoff with jitter) and traced via Langfuse (see
+  [Observability](#observability-langfuse)).
 
 ## Setup
 
@@ -55,17 +57,22 @@ Canonical Category (consistent across all customers)
    ```
 
    > A `.venv/` in the project root is the supported way to work on this
-   > project — it keeps `torch`, `sentence-transformers`, etc. isolated. It is
-   > git-ignored. Re-activate it (`source .venv/bin/activate`) in each new shell.
+   > project — it keeps the LangChain / FAISS deps isolated. It is git-ignored.
+   > Re-activate it (`source .venv/bin/activate`) in each new shell.
 
-2. **Configure your API key:**
+2. **Configure your keys:**
 
    ```bash
    cp .env.example .env
-   # then edit .env and set GROQ_API_KEY=...
+   # then edit .env:
+   #   OPENAI_API_KEY=...        (required — chat + embeddings)
+   #   LANGFUSE_PUBLIC_KEY=...   (optional — tracing)
+   #   LANGFUSE_SECRET_KEY=...
    ```
 
-   Get a key at <https://console.groq.com>.
+   Get an OpenAI key at <https://platform.openai.com/api-keys> and (optionally)
+   Langfuse keys at <https://cloud.langfuse.com>. Without the `LANGFUSE_*` keys
+   the pipeline runs normally and tracing is simply skipped.
 
 ## Usage
 
@@ -160,7 +167,7 @@ python classify.py \
     "actor": "element"
   },
   "category": "Structural Mismatch Error",
-  "embedding_dim": 384
+  "embedding_dim": 1536
 }
 ```
 
@@ -184,7 +191,7 @@ python classify.py \
     "actor": "element"
   },
   "category": "Structural Mismatch Error",
-  "embedding_dim": 384
+  "embedding_dim": 1536
 }
 ```
 
@@ -199,7 +206,9 @@ python classify.py \
 | `faiss_index/` | LangChain FAISS vector store (`index.faiss` + `index.pkl`). The searchable record of every error, with the full record in each document's metadata; backs `find_similar_errors`. |
 | `review_queue.jsonl` | Errors that returned `Unknown / Unclassified`, queued for human review. |
 
-These are created automatically on first run and are git-ignored.
+These are created automatically on first run and are git-ignored. The FAISS
+vectors are 1536-dim (`text-embedding-3-small`); if you switch embedding models,
+delete `faiss_index/` first to avoid a dimension mismatch.
 
 ## Configuration
 
@@ -207,12 +216,29 @@ Defined at the top of [`engine.py`](engine.py):
 
 | Setting | Value |
 |---------|-------|
-| LLM | `ChatGroq`, model `llama-3.3-70b-versatile` |
-| Embeddings | `HuggingFaceEmbeddings`, `all-MiniLM-L6-v2` (L2-normalized) |
+| LLM | `ChatOpenAI`, model `gpt-4o-mini` |
+| Embeddings | `OpenAIEmbeddings`, `text-embedding-3-small` (1536-dim, unit-normalized) |
 | Vector store | LangChain `FAISS` (cosine via squared-L2 conversion) |
+| Tracing | Langfuse LangChain `CallbackHandler` (optional) |
 | `max_tokens` | `200` |
 | `temperature` | `0` |
 | Retry policy | `.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)` per chain |
+
+## Observability (Langfuse)
+
+The two LLM stages are traced with [Langfuse](https://langfuse.com) via its
+LangChain `CallbackHandler`, attached per-invoke. Each `classify_pipeline` (and
+`find_similar_errors`) call is wrapped with `@observe()`, so one call shows up as
+**a single trace** in the Langfuse dashboard, with the `normalize_error` and
+`classify_error` LLM generations nested under it.
+
+- Tracing is **opt-in by env**: set `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
+  (and optionally `LANGFUSE_BASE_URL`) to enable it. Without them the engine
+  runs on OpenAI alone and tracing is skipped — no code change needed.
+- The CLI flushes buffered traces on exit, so short-lived runs still report.
+- **Note:** the LangChain callback captures LLM/chain runs only. Stage 2
+  embeddings (`OpenAIEmbeddings`) are **not** emitted as separate Langfuse
+  generations — this is inherent to LangChain's callback model.
 
 ## Taxonomy governance
 

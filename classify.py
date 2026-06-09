@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 
 from engine import classify_pipeline, find_similar_errors
@@ -162,20 +163,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Batch mode takes precedence when --input is given.
-    if args.input:
-        if not args.output:
-            parser.error("--input requires --output (the CSV to write results to).")
-        return run_batch(args.input, args.output)
+    try:
+        # Batch mode takes precedence when --input is given.
+        if args.input:
+            if not args.output:
+                parser.error("--input requires --output (the CSV to write results to).")
+            return run_batch(args.input, args.output)
 
-    # Otherwise fall back to the existing single-record mode.
-    if args.error and args.customer:
-        return run_single(args)
+        # Otherwise fall back to the existing single-record mode.
+        if args.error and args.customer:
+            return run_single(args)
 
-    parser.error(
-        "provide either --error and --customer (single mode), "
-        "or --input and --output (batch CSV mode)."
-    )
+        parser.error(
+            "provide either --error and --customer (single mode), "
+            "or --input and --output (batch CSV mode)."
+        )
+    finally:
+        _flush_langfuse()
+
+
+def _flush_langfuse() -> None:
+    """Flush buffered Langfuse traces before this short-lived process exits.
+
+    No-op (and silent) when Langfuse isn't configured.
+    """
+    if not os.getenv("LANGFUSE_PUBLIC_KEY"):
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception:  # noqa: BLE001 - tracing must never break the CLI
+        pass
 
 
 if __name__ == "__main__":

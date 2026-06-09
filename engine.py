@@ -2,15 +2,17 @@
 
 Pipeline:
     Stage 1  normalize_error()    raw error -> intent fingerprint
-             (ChatGroq + ChatPromptTemplate + JsonOutputParser, via LCEL)
+             (ChatOpenAI + ChatPromptTemplate + JsonOutputParser, via LCEL)
     Stage 2  embed_fingerprint()  fingerprint -> embedding vector
-             (langchain-huggingface HuggingFaceEmbeddings, all-MiniLM-L6-v2)
+             (langchain-openai OpenAIEmbeddings, text-embedding-3-small)
     Stage 3  classify_error()     fingerprint -> one canonical category
-             (ChatGroq + ChatPromptTemplate + StrOutputParser, via LCEL)
+             (ChatOpenAI + ChatPromptTemplate + StrOutputParser, via LCEL)
 
-Every classified error is stored in a LangChain FAISS vector store, which backs
-``find_similar_errors()``. The orchestrator ``classify_pipeline()`` runs all
-three stages, persists the result, and returns the record.
+LLM stages are traced with Langfuse via the LangChain CallbackHandler (attached
+per-invoke, env-gated). Every classified error is stored in a LangChain FAISS
+vector store, which backs ``find_similar_errors()``. The orchestrator
+``classify_pipeline()`` runs all three stages, persists the result, and returns
+the record; it is wrapped with ``@observe`` so a run forms a single trace.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
+from langfuse import observe
 
 from taxonomy import CATEGORY_NAMES, TAXONOMY, UNKNOWN_CATEGORY, get_category
 
@@ -35,8 +38,8 @@ from taxonomy import CATEGORY_NAMES, TAXONOMY, UNKNOWN_CATEGORY, get_category
 
 load_dotenv()
 
-MODEL = "llama-3.3-70b-versatile"
-EMBED_MODEL = "all-MiniLM-L6-v2"
+CHAT_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL = "text-embedding-3-small"
 MAX_TOKENS = 200
 TEMPERATURE = 0
 MAX_RETRIES = 3
@@ -85,25 +88,51 @@ CLASSIFY_PROMPT = ChatPromptTemplate.from_messages(
 
 @lru_cache(maxsize=1)
 def _llm():
-    from langchain_groq import ChatGroq
+    from langchain_openai import ChatOpenAI
 
-    if not os.getenv("GROQ_API_KEY"):
+    if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
-            "GROQ_API_KEY is not set. Copy .env.example to .env and add your key."
+            "OPENAI_API_KEY is not set. Copy .env.example to .env and add your key."
         )
-    return ChatGroq(model=MODEL, temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
+    return ChatOpenAI(model=CHAT_MODEL, temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
 
 
 @lru_cache(maxsize=1)
 def _embedder():
-    # Imported here so the heavy torch / sentence-transformers import only
-    # happens when embeddings are actually needed.
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_openai import OpenAIEmbeddings
 
-    return HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL,
-        encode_kwargs={"normalize_embeddings": True},
-    )
+    # text-embedding-3-small returns 1536-dim, unit-normalized vectors.
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+
+@lru_cache(maxsize=1)
+def _langfuse_handler():
+    from langfuse.langchain import CallbackHandler
+
+    return CallbackHandler()
+
+
+def _run_config() -> dict:
+    """Attach the Langfuse tracer only when Langfuse is configured.
+
+    Without ``LANGFUSE_PUBLIC_KEY`` the chains run normally and tracing is
+    skipped, so the engine works fine with OpenAI alone.
+    """
+    if os.getenv("LANGFUSE_PUBLIC_KEY"):
+        return {"callbacks": [_langfuse_handler()]}
+    return {}
+
+
+def _traced(name: str):
+    """Decorator: wrap with Langfuse ``@observe`` only when configured.
+
+    When ``LANGFUSE_PUBLIC_KEY`` is unset this is the identity decorator, so the
+    function runs untouched and Langfuse never logs a "no public_key" warning.
+    Env is read at import time (after ``load_dotenv()``).
+    """
+    if os.getenv("LANGFUSE_PUBLIC_KEY"):
+        return observe(name=name)
+    return lambda fn: fn
 
 
 def _retry(runnable):
@@ -150,7 +179,7 @@ def _coerce_fingerprint(parsed: dict) -> dict:
 
 def normalize_error(raw_error: str) -> dict:
     """Extract a structured intent fingerprint from a raw error message."""
-    return _normalize_chain().invoke({"raw_error": raw_error})
+    return _normalize_chain().invoke({"raw_error": raw_error}, config=_run_config())
 
 
 # --------------------------------------------------------------------------- #
@@ -200,7 +229,7 @@ def classify_error(fingerprint: dict) -> str:
         f"{_build_few_shot_block()}\n\n"
         f"fingerprint: {fingerprint_json}"
     )
-    return _classify_chain().invoke({"user_message": user_message})
+    return _classify_chain().invoke({"user_message": user_message}, config=_run_config())
 
 
 def _coerce_category(raw: str) -> str:
@@ -303,8 +332,13 @@ def _persist_result(result: dict) -> None:
 # Orchestrator
 # --------------------------------------------------------------------------- #
 
+@_traced("classify_pipeline")
 def classify_pipeline(raw_error: str, customer_id: str) -> dict:
-    """Run all three stages, persist the result, and return it."""
+    """Run all three stages, persist the result, and return it.
+
+    ``@observe`` opens one Langfuse trace per call; the normalize/classify chain
+    invocations nest under it as generations (when Langfuse is configured).
+    """
     fingerprint = normalize_error(raw_error)
     vector = embed_fingerprint(fingerprint)
     category = classify_error(fingerprint)
@@ -329,12 +363,13 @@ def classify_pipeline(raw_error: str, customer_id: str) -> dict:
 def _l2_to_cosine(squared_l2: float) -> float:
     """Convert FAISS squared-L2 distance to cosine similarity.
 
-    Embeddings are L2-normalized, so ||a - b||^2 = 2 - 2*cos, giving
-    cos = 1 - dist/2 (higher = more similar).
+    OpenAI ``text-embedding-3-*`` vectors are unit-normalized, so
+    ||a - b||^2 = 2 - 2*cos, giving cos = 1 - dist/2 (higher = more similar).
     """
     return float(1.0 - squared_l2 / 2.0)
 
 
+@_traced("find_similar_errors")
 def find_similar_errors(raw_error: str, top_k: int = 5) -> list[dict]:
     """Return the top-k most similar previously-classified errors.
 

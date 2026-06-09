@@ -9,8 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Configure the Groq key (required for any LLM call)
-cp .env.example .env   # then set GROQ_API_KEY
+# Configure keys: OPENAI_API_KEY (required); LANGFUSE_* (optional, for tracing)
+cp .env.example .env   # then set OPENAI_API_KEY
 
 # Run the classifier
 python classify.py --error "your error here" --customer "customer_a"
@@ -28,23 +28,23 @@ customers* (who phrase the "same" problem differently) into one shared,
 fixed taxonomy. The whole point is convergence: distinct wordings must land on
 the same canonical category.
 
-The pipeline is built on **LangChain** (LCEL chains, `langchain-groq`,
-`langchain-huggingface`, FAISS). It lives entirely in `engine.py`; `classify.py`
-is a thin CLI wrapper (single record + `--input`/`--output` CSV batch mode);
+The pipeline is built on **LangChain** (LCEL chains, `langchain-openai`, FAISS),
+with **Langfuse** tracing. It lives entirely in `engine.py`; `classify.py` is a
+thin CLI wrapper (single record + `--input`/`--output` CSV batch mode);
 `taxonomy.py` is data.
 
-- **Stage 1 — `normalize_error()`** (LCEL chain: `ChatPromptTemplate | ChatGroq |
-  JsonOutputParser | RunnableLambda(_coerce_fingerprint)`, model
-  `llama-3.3-70b-versatile`): raw error → an "intent fingerprint" dict with
-  exactly the keys in `FINGERPRINT_KEYS` (`violation_type`, `constraint_kind`,
-  `scope`, `actor`). Customer-specific values (paths, element/field names, line
-  numbers) are stripped by the system prompt so only structural intent remains.
-- **Stage 2 — `embed_fingerprint()`** (`HuggingFaceEmbeddings`,
-  `all-MiniLM-L6-v2`, 384-dim, L2-normalized): the fingerprint is serialized
-  deterministically (`json.dumps(..., sort_keys=True)`) before embedding, so
-  identical fingerprints always embed identically. Used only for similarity
-  search, **not** for classification.
-- **Stage 3 — `classify_error()`** (LCEL chain: `ChatPromptTemplate | ChatGroq |
+- **Stage 1 — `normalize_error()`** (LCEL chain: `ChatPromptTemplate | ChatOpenAI |
+  JsonOutputParser | RunnableLambda(_coerce_fingerprint)`, model `gpt-4o-mini`):
+  raw error → an "intent fingerprint" dict with exactly the keys in
+  `FINGERPRINT_KEYS` (`violation_type`, `constraint_kind`, `scope`, `actor`).
+  Customer-specific values (paths, element/field names, line numbers) are
+  stripped by the system prompt so only structural intent remains.
+- **Stage 2 — `embed_fingerprint()`** (`OpenAIEmbeddings`,
+  `text-embedding-3-small`, 1536-dim, unit-normalized): the fingerprint is
+  serialized deterministically (`json.dumps(..., sort_keys=True)`) before
+  embedding, so identical fingerprints always embed identically. Used only for
+  similarity search, **not** for classification.
+- **Stage 3 — `classify_error()`** (LCEL chain: `ChatPromptTemplate | ChatOpenAI |
   StrOutputParser | RunnableLambda(_coerce_category)`): given the fingerprint
   plus the taxonomy definitions and few-shot examples rendered from
   `taxonomy.py`, the LLM must return exactly one category *name*.
@@ -52,6 +52,14 @@ is a thin CLI wrapper (single record + `--input`/`--output` CSV batch mode);
 System prompts are attached as static `SystemMessage` objects (not template
 tuples) so the literal JSON braces in the normalize prompt are not parsed as
 LCEL template variables; only the human turn carries a `{variable}`.
+
+**Tracing:** the two LLM chains are traced via Langfuse's LangChain
+`CallbackHandler`, attached per-invoke through `config=_run_config()` — which is
+env-gated, so it's a no-op (and OpenAI runs fine) without `LANGFUSE_PUBLIC_KEY`.
+`classify_pipeline()`/`find_similar_errors()` are wrapped with `@observe()`, so a
+call is one Langfuse trace with the stage generations nested under it. The CLI
+flushes traces on exit. Note: the LangChain callback captures **LLM** runs only —
+`OpenAIEmbeddings` (Stage 2) calls are not emitted as separate generations.
 
 `classify_pipeline()` orchestrates all three, assigns a UUID, persists, and
 returns the record. `find_similar_errors()` re-normalizes + embeds a query and
@@ -88,16 +96,18 @@ The FAISS store is the source of truth for similarity search; records are added
 pre-embedded via `add_embeddings` (no re-encoding). `errors.jsonl` is a parallel
 human-readable log, not used for search. Loading the store uses
 `allow_dangerous_deserialization=True` (safe: the index is self-produced).
+**The store's vectors are 1536-dim (`text-embedding-3-small`); changing the
+embedding model requires deleting `faiss_index/` first (dimension mismatch).**
 
 ## Conventions
 
-- LangChain components (`ChatGroq` LLM, `HuggingFaceEmbeddings`, and the two LCEL
-  chains) are `@lru_cache`-wrapped lazy singletons so importing `engine` is cheap
-  and the torch/groq imports are deferred until first use.
+- LangChain components (`ChatOpenAI` LLM, `OpenAIEmbeddings`, the two LCEL chains,
+  and the Langfuse `CallbackHandler`) are `@lru_cache`-wrapped lazy singletons so
+  importing `engine` is cheap and provider imports are deferred until first use.
 - Retries are LangChain-native: each chain is wrapped with `.with_retry(
   stop_after_attempt=3, wait_exponential_jitter=True)` via the `_retry()` helper.
-  `MODEL`, `EMBED_MODEL`, `MAX_TOKENS`, `TEMPERATURE` (0, for determinism) and
-  `MAX_RETRIES` are configured at the top of `engine.py`.
+  `CHAT_MODEL`, `EMBEDDING_MODEL`, `MAX_TOKENS`, `TEMPERATURE` (0, for
+  determinism) and `MAX_RETRIES` are configured at the top of `engine.py`.
 - JSON from Stage 1 is parsed by LangChain's `JsonOutputParser`; key presence is
   then guaranteed by `_coerce_fingerprint` (fills any missing `FINGERPRINT_KEYS`
   with `""`).
